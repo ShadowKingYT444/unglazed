@@ -36,6 +36,43 @@ from .paths import build_dir  # noqa: E402
 
 BUILD = build_dir()          # build/<video>, set by `unglazed render` through UNGLAZED_BUILD
 CACHE = BUILD / "tiles"
+_NO_HOLD = os.environ.get("UNGLAZED_NO_HOLD") == "1"
+
+
+def _encoder_args(fps):
+    """Fast encoders. The clips are joined without re-encoding, so this is the only video encode in a build."""
+    gop = str(int(2 * fps))
+    if os.environ.get("UNGLAZED_ENCODER") == "nvenc":
+        return ["-c:v", "h264_nvenc", "-preset", "p5", "-tune", "hq", "-rc", "constqp", "-qp", "19", "-g", gop, "-pix_fmt", "yuv420p"]
+    return ["-c:v", "libx264", "-preset", "veryfast", "-crf", "17", "-g", gop, "-pix_fmt", "yuv420p",
+            "-threads", os.environ.get("UNGLAZED_THREADS", "4")]
+
+
+def _patch_writer():
+    import manimlib.scene.scene_file_writer as sfw
+    if getattr(sfw.SceneFileWriter, "_unglazed", False):
+        return
+    orig = sfw.SceneFileWriter.open_movie_pipe
+
+    def open_movie_pipe(self, file_path):
+        real = sfw.sp.Popen
+        fps = self.scene.camera.fps
+
+        def popen(cmd, **kw):
+            i = cmd.index("-loglevel") + 2            # keep the raw-frame input options, replace the encoder options
+            return real(cmd[:i] + _encoder_args(fps) + [cmd[-1]], **kw)
+
+        sfw.sp.Popen = popen
+        try:
+            return orig(self, file_path)
+        finally:
+            sfw.sp.Popen = real
+
+    sfw.SceneFileWriter.open_movie_pipe = open_movie_pipe
+    sfw.SceneFileWriter._unglazed = True
+
+
+_patch_writer()
 
 # ---------------------------------------------------------------- style
 BG = "#000000"
@@ -62,6 +99,7 @@ def Tx(text: str, size: float = 0.42, color=FG, weight=NORMAL, **kw) -> Text:
     fs = 48 * size * 0.9 / _H48[weight]
     t = Text(text, font=FONT, weight=weight, font_size=fs, **kw)
     t.set_color(color)
+    t._label = text
     return t
 
 
@@ -104,6 +142,7 @@ def M(*parts, colors=None, size=0.62, gap=0.06, color=FG) -> VGroup:
         x += w + gap
     group.scale(size, about_point=ORIGIN)
     group.center()
+    group._label = "math: " + " ".join(parts)[:40]
     return group
 
 
@@ -120,6 +159,7 @@ class BeatScene(Scene):
             raise FileNotFoundError(f"{f} missing; run `unglazed voice <video>` (or add --estimate) first")
         self.tm = json.loads(f.read_text())[self.SID]
         self.overruns = []
+        self._lint_seen = set()
         self.clock = ValueTracker(0.0)
 
     def start(self, i: int) -> float:
@@ -133,14 +173,57 @@ class BeatScene(Scene):
         return max(0.1, self.start(i) - self.time)
 
     def at(self, i: int, offset: float = 0.0):
+        if i > 0 and offset == 0.0:
+            self.lint(i - 1)                       # the picture of the previous beat is complete now
         dt = self.start(i) + offset - self.time
         if dt > 1 / 60:
             self.wait(dt)
         elif dt < -0.25:
             self.overruns.append((i, round(-dt, 2)))
 
+    def wait(self, duration=None, stop_condition=None, **kw):
+        """Like Scene.wait, but a still picture is drawn once and its bytes are written for every held frame.
+
+        Explainers hold the picture while the voice talks, so this is where most frames are. A wait is 'still' when
+        no mobject has a time-based updater (updaters that only read trackers give the same frame every time).
+        Set UNGLAZED_NO_HOLD=1 to switch this off.
+        """
+        fw = getattr(self, "file_writer", None)
+        fps = self.camera.fps
+        still = (
+            not _NO_HOLD and duration and stop_condition is None and not kw and not self.skip_animations
+            and fw is not None and getattr(fw, "write_to_movie", False) and getattr(fw, "frames", None) is not None
+            and not any(m.has_time_based_updaters() for m in self.mobjects)
+        )
+        n = len(np.arange(0, duration, 1 / fps)) if still else 0
+        if n < 3:
+            return super().wait(duration, stop_condition, **kw)
+        self.pre_play()
+        self.update_mobjects(dt=0)
+        self.update_frame(1 / fps)
+        self.emit_frame()                          # one real frame
+        fw.frames.drain()                          # everything in flight reaches ffmpeg, in order
+        frame = bytes(self.camera.get_frame_bytes())
+        sink = fw.writing_process.stdin
+        for _ in range(n - 1):
+            self.increment_time(1 / fps)
+            sink.write(frame)
+        if getattr(fw, "progress_display", None) is not None:
+            fw.progress_display.update(n - 1)
+        self.held_frames = getattr(self, "held_frames", 0) + n - 1
+        self.post_play()
+
+    def lint(self, beat):
+        """Layout check of the picture as it stands: labels off the frame, overlapping, or too small to read."""
+        for msg in layout_problems(self):
+            line = f"[{self.SID}] LAYOUT beat {beat}: {msg}"
+            if line not in self._lint_seen:
+                self._lint_seen.add(line)
+                print(line)
+
     def finish(self, fade=True):
-        end = self.tm["total"]
+        end = self.tm["total"] + 2 / self.camera.fps     # two spare frames; the join cuts each clip to its exact length
+        self.lint(len(self.tm["beats"]) - 1)
         mobs = [m for m in self.mobjects if m is not self.frame]
         if fade and mobs and end - self.time > 0.8:
             self.wait(end - self.time - 0.7)
@@ -149,7 +232,9 @@ class BeatScene(Scene):
             self.wait(end - self.time)
         if self.overruns:
             print(f"[{self.SID}] OVERRUN beats (beat, seconds late): {self.overruns}")
-        print(f"[{self.SID}] scene time {self.time:.2f}s vs audio {end:.2f}s")
+        held = getattr(self, "held_frames", 0)
+        total = max(1, int(round(self.time * self.camera.fps)))
+        print(f"[{self.SID}] scene time {self.time:.2f}s vs audio {end:.2f}s  ({100 * held // total}% of frames held)")
 
     def chapter(self, numeral: str, title: str, until_beat: int = 1):
         """Roman numeral + lowercase title on a black screen, like the reference."""
@@ -682,3 +767,106 @@ def spread_cols(heat: "Heat", xs, y=None):
     if len(heat.nums):
         heat.relabel()
     return heat
+
+
+# ---------------------------------------------------------------- composition: zones, focus, and a layout check
+class Stage:
+    """Named zones of the 14.2 x 8 frame, as (centre x, centre y, width, height).
+
+    Compose every scene from these, so that recurring things sit in the same place for the whole video:
+    the concept title on top, one large object in `main`, or two balanced columns `left` / `right`
+    (code or algebra on one side, the picture on the other), a one-line note in `foot`.
+    """
+
+    title = (0.0, 3.4, 12.6, 0.7)
+    main = (0.0, -0.3, 13.0, 6.1)          # everything under the title
+    full = (0.0, 0.0, 13.2, 7.0)           # no title
+    left = (-3.45, -0.3, 6.3, 6.1)
+    right = (3.45, -0.3, 6.3, 6.1)
+    left_wide = (-2.45, -0.3, 8.3, 6.1)
+    right_narrow = (4.6, -0.3, 4.0, 6.1)
+    left_narrow = (-4.6, -0.3, 4.0, 6.1)
+    right_wide = (2.45, -0.3, 8.3, 6.1)
+    top = (0.0, 1.55, 13.0, 2.6)           # upper half of main
+    bottom = (0.0, -2.0, 13.0, 2.8)        # lower half of main
+    foot = (0.0, -3.6, 12.6, 0.45)
+
+
+def place(mob, zone, align=ORIGIN, grow=False, max_grow=1.5):
+    """Fit mob into a Stage zone (shrink if needed, enlarge if grow=True) and put it there.
+
+    align: ORIGIN for the centre, or LEFT / RIGHT / UP / DOWN (and corners) to push it to that side of the zone.
+    """
+    cx, cy, w, h = zone
+    k = min(w / max(mob.get_width(), 1e-6), h / max(mob.get_height(), 1e-6))
+    if k < 1 or grow:
+        mob.scale(min(k, max_grow) if grow else k)
+    mob.move_to(np.array([cx, cy, 0.0]))
+    if np.any(np.asarray(align) != 0):
+        dx = (w - mob.get_width()) / 2 * align[0]
+        dy = (h - mob.get_height()) / 2 * align[1]
+        mob.shift(np.array([dx, dy, 0.0]))
+    return mob
+
+
+def focus(mob, color=RED, buff=0.1, width=3):
+    """The red box that says 'look here': one per moment."""
+    return SurroundingRectangle(mob, buff=buff).set_stroke(color, width)
+
+
+def concept_title(text, size=0.44, color=FG):
+    """The title of the current concept. It stays on top while the content under it changes."""
+    return place(Tx(text, size, color), Stage.title)
+
+
+def _label_boxes(scene):
+    out, seen = [], set()
+    for top in scene.mobjects:
+        if top is scene.frame:
+            continue
+        for m in top.get_family():
+            if not hasattr(m, "_label") or id(m) in seen:
+                continue
+            seen.add(id(m))
+            parts = [x for x in m.get_family() if isinstance(x, VMobject) and x.has_points()]
+            if not parts:
+                continue
+            op = max(max(float(x.get_fill_opacity()), float(x.get_stroke_opacity()) if x.get_stroke_width() > 0 else 0.0) for x in parts)
+            if op < 0.2:
+                continue
+            c, w, h = m.get_center(), m.get_width(), m.get_height()
+            out.append((str(m._label)[:28], c[0] - w / 2, c[0] + w / 2, c[1] - h / 2, c[1] + h / 2))
+    return out
+
+
+_TALL = set("bdfhijkltgpqyABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789()[]|/")   # a word without these is only x-height tall
+
+
+def layout_problems(scene, limit=6):
+    """Labels (text and math) that run off the frame, overlap each other, or are too small to read at 1080p."""
+    fc, fw, fh = scene.frame.get_center(), scene.frame.get_width(), scene.frame.get_height()
+    k = fw / 14.222                                   # camera zoom: sizes are judged as they appear on screen
+    x0, x1, y0, y1 = fc[0] - fw / 2, fc[0] + fw / 2, fc[1] - fh / 2, fc[1] + fh / 2
+    edge = 0.12 * k
+    boxes = _label_boxes(scene)
+    out = []
+    for name, a, b, c, d in boxes:
+        if b < x0 or a > x1 or d < y0 or c > y1:
+            continue                                   # completely outside: parked on purpose
+        side = [s for s, bad in (("left", a < x0 + edge), ("right", b > x1 - edge), ("bottom", c < y0 + edge), ("top", d > y1 - edge)) if bad]
+        if side:
+            out.append(f"'{name}' runs off the frame ({', '.join(side)})")
+        elif (d - c) < (0.15 if any(ch in _TALL for ch in name) else 0.095) * k and (b - a) > 0.1 * k and any(ch.isalnum() for ch in name):
+            out.append(f"'{name}' is too small to read ({(d - c) / k * 135:.0f} px tall at 1080p)")
+    vis = [bx for bx in boxes if not (bx[2] < x0 or bx[1] > x1 or bx[4] < y0 or bx[3] > y1)]
+    for i in range(len(vis)):
+        n1, a1, b1, c1, d1 = vis[i]
+        for j in range(i + 1, len(vis)):
+            n2, a2, b2, c2, d2 = vis[j]
+            ix, iy = min(b1, b2) - max(a1, a2), min(d1, d2) - max(c1, c2)
+            if ix <= 0 or iy <= 0:
+                continue
+            small = min((b1 - a1) * (d1 - c1), (b2 - a2) * (d2 - c2))
+            if small > 0 and ix * iy / small > 0.2:
+                out.append(f"'{n1}' overlaps '{n2}'")
+    return out[:limit]

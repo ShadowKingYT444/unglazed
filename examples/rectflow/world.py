@@ -1,5 +1,9 @@
-"""The toy world of the technical ReLF video: a small language, the paper's embedding recipe run on it,
-and the exact denoiser, so every number on screen is computed with the paper's own formulas.
+"""The worlds of "Rectified flow, from scratch", one per rung of the ladder. Everything on screen is computed here.
+
+  rung 1  the two-number world: data is -1 or +1. Guess, flow, diffusion-style sampling and reflow in closed form.
+  rung 2  one word slot: four words on a plane (T4_*).
+  rung 3  a sentence: twelve sentences, the paper's embedding recipe, and the exact denoiser (Lang).
+  rung 4  the real model: numbers quoted from the paper (see coverage.py).
 
 Paper: Rectified Language Flow (Su, Liao, Chen, Liu), arXiv 2610.33811. Convention: t = 0 noise, t = 1 data.
 """
@@ -158,11 +162,73 @@ def post4(z, t):
     return p / p.sum(1, keepdims=True)
 
 
+# ---------------------------------------------------------------- rung 1: the two-number world
+def guess1(x, t):
+    """E[x1 | x_t = x] when x1 is -1 or +1 (half each) and x_t = t x1 + (1 - t) noise:  tanh(t x / (1 - t)^2)."""
+    return np.tanh(t * np.asarray(x, float) / max(1 - t, 1e-6) ** 2)
+
+
+def flow1(x0, steps, guess=guess1):
+    """Follow the guess: x <- x + h / (1 - t) * (guess - x). Returns ts (steps+1,) and paths (steps+1, N)."""
+    ts = np.linspace(0, 1, steps + 1)
+    x = np.array(x0, float)
+    out = [x.copy()]
+    for a, b in zip(ts[:-1], ts[1:]):
+        x = x + (b - a) / (1 - a) * (guess(x, a) - x)
+        out.append(x.copy())
+    return ts, np.stack(out)
+
+
+def noisy1(x0, steps, rng, sigma=6.0):
+    """A diffusion-style sampler in the same world: each step first swaps part of the noise for fresh noise."""
+    ts = np.linspace(0, 1, steps + 1)
+    x = np.array(x0, float)
+    out = [x.copy()]
+    for a, b in zip(ts[:-1], ts[1:]):
+        h, rem = b - a, 1 - a
+        g = guess1(x, a)
+        eps = (x - a * g) / rem
+        d = min(sigma * h * rem, rem)
+        x = x - d * eps + np.sqrt(rem * rem - (rem - d) ** 2) * rng.normal(size=x.shape)
+        x = x + h / rem * (g - x)
+        out.append(x.copy())
+    return ts, np.stack(out)
+
+
+def reflow_guess1(x, t):
+    """After reflow the pairs are (noise, sign of the noise), their lines never cross, and the guess is exact."""
+    return np.sign(np.asarray(x, float))
+
+
 def build():
     emb = hellinger_svd(SENTENCES)
     lang = Lang(SENTENCES, emb)
     W = SimpleNamespace(emb=emb, lang=lang, sentences=SENTENCES, T4=T4, T4_PI=T4_PI, T4_E=T4_E)
     rng = np.random.default_rng(0)
+    # rung 1
+    r1 = np.random.default_rng(11)
+    W.x0 = r1.normal(size=10_000)
+    W.x1_random = r1.choice([-1.0, 1.0], size=10_000)            # an independent random pairing
+    W.ts1, W.flow_paths = flow1(W.x0[:400], 200)
+    W.flow_end = flow1(W.x0, 200)[1][-1]
+    W.few = {n: flow1(W.x0, n)[1][-1] for n in (1, 2, 4, 16, 64)}
+    W.few_paths = {n: flow1(W.x0[:400], n)[1] for n in (1, 2, 4)}
+    W.ts_noisy, W.noisy_paths = noisy1(W.x0[:400], 200, r1)
+    W.noisy_end = noisy1(W.x0, 200, np.random.default_rng(12))[1][-1]
+    W.reflow_paths = flow1(W.x0[:400], 200, guess=reflow_guess1)[1]
+    W.reflow_one = flow1(W.x0, 1, guess=reflow_guess1)[1][-1]
+    disp = W.flow_end[:400] - W.x0[:400]
+    vel = np.diff(W.flow_paths, axis=0) / np.diff(W.ts1)[:, None]
+    W.curviness_before = float(((vel - disp[None]) ** 2).mean())
+    d2 = W.reflow_paths[-1] - W.x0[:400]
+    v2 = np.diff(W.reflow_paths, axis=0) / np.diff(W.ts1)[:, None]
+    W.curviness_after = float(((v2 - d2[None]) ** 2).mean())
+    # rung 2: one word slot. Follow the exact guess from 10,000 noise points and count where they land.
+    z = np.random.default_rng(13).normal(size=(10_000, 2))
+    tt = np.linspace(0, 1, 201)
+    for a, b in zip(tt[:-1], tt[1:]):
+        z = z + (b - a) / (1 - a) * (post4(z, min(a, 0.999)) @ T4_E - z)
+    W.t4_share = np.bincount(((z[:, None] - T4_E[None]) ** 2).sum(-1).argmin(1), minlength=4) / len(z)
     # demo run for the sampling scene: 16 evaluations; pick a start whose positions commit at different times
     ts16 = np.linspace(0, 1, 17)[:-1]
     best = None
@@ -226,6 +292,13 @@ if __name__ == "__main__":
     W = _world.load(rebuild=True)
     e, lang = W.emb, W.lang
     np.set_printoptions(precision=2, suppress=True)
+    print("rung 1: guess(0.3, 0.5) = %.3f, velocity = %.3f" % (guess1(0.3, 0.5), (guess1(0.3, 0.5) - 0.3) / 0.5))
+    for n, e in W.few.items():
+        print("  %2d steps: mean distance to the nearest of -1/+1 = %.3f, share landing within 0.1 = %.2f" % (n, np.abs(np.abs(e) - 1).mean(), (np.abs(np.abs(e) - 1) < 0.1).mean()))
+    print("  flow, 200 steps: share at +1 = %.3f; noisy sampler: mean distance %.3f, share at +1 = %.3f" % ((W.flow_end > 0).mean(), np.abs(np.abs(W.noisy_end) - 1).mean(), (W.noisy_end > 0).mean()))
+    print("  reflow, 1 step: mean distance %.4f; curviness before %.3f after %.5f" % (np.abs(np.abs(W.reflow_one) - 1).mean(), W.curviness_before, W.curviness_after))
+    print("  flow keeps the sign of the noise: %.4f" % (np.sign(W.flow_end) == np.sign(W.x0)).mean())
+    print("  rung 2 shares", dict(zip(W.T4, W.t4_share.round(3))), "prior", W.T4_PI)
     print("E4", W.T4_E.round(2).tolist(), "check", (W.T4_PI[:, None] * W.T4_E).sum(0).round(3), (W.T4_PI * (W.T4_E ** 2).sum(1)).sum().round(3))
     print("demo sentence:", W.demo_sent)
     for k in range(0, 16, 3):

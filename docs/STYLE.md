@@ -46,3 +46,19 @@ The target is in between: the screen carries the idea, and the idea is complete.
 - `segments()` draws thousands of lines as one object. Use `growing_segments()` when all lines must grow together.
 - Time a beat with fractions of `self.dur(i)` and `self.left(i + 1)`, never with fixed seconds, so a narration edit
   does not break the scene.
+
+## Placement
+
+Compose every scene from the named zones in `Stage` (`title`, `main`, `left` / `right`, `left_wide` /
+`right_narrow`, `top` / `bottom`, `foot`) with `place(mob, zone)`.
+
+- **One picture per rung.** Pick the picture for a part of the video and keep it: same axes, same place, same
+  colours. New ideas are drawn onto it. In the demo, eleven scenes share one time-against-value picture.
+- **One large object, or two balanced columns**: the picture on one side, the algebra, bars or code on the other.
+- **A label sits next to its object**, outside the lines that cross it. 0.3 is the smallest comfortable text size.
+- **When something appears, something dims or leaves.** About five lit labels at once is the limit.
+- **Empty space is fine.** A sparse frame with one large object reads better than a full frame of small ones.
+
+`BeatScene` checks every finished beat and prints `LAYOUT` lines for text that runs off the frame, overlaps other
+text, or is too small to read at 1080p. The check cannot see a label lying on a curve or a picture that is too
+small, so `unglazed sheet` and your eyes are still part of the method.

@@ -21,14 +21,14 @@ jobs:
       - name: Install the package (without the renderer) and the test tools
         run: |
           python -m pip install --upgrade pip
-          pip install numpy pytest ruff
+          pip install numpy soundfile pytest ruff
           pip install -e . --no-deps
       - name: Lint
         run: ruff check .
       - name: Tests
         run: pytest -q
-      - name: The demo video passes its own depth check
-        run: unglazed check examples/relf
+      - name: The demo video passes its own depth and teaching checks
+        run: unglazed check examples/rectflow
       - name: New video, check, and a silent draft of the narration
         run: |
           unglazed new smoke

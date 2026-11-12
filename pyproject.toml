@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "unglazed"
-version = "0.1.0"
+version = "0.2.0"
 description = "Technical explainer videos for ML papers that do not skip steps: a depth contract, a visual kit on ManimGL, local narration, one command."
 readme = "README.md"
 license = { text = "MIT" }
@@ -29,6 +29,8 @@ dependencies = [
 
 [project.optional-dependencies]
 voice = ["kokoro>=0.9.4", "soundfile>=0.12", "torch>=2.2"]
+pocket = ["pocket-tts", "soundfile>=0.12"]
+verify = ["faster-whisper>=1.0"]
 dev = ["pytest>=8", "ruff>=0.6"]
 
 [project.scripts]

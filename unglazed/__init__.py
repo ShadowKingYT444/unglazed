@@ -5,4 +5,4 @@
 
 The command line tool is `unglazed` (see `unglazed --help`).
 """
-__version__ = "0.1.0"
+__version__ = "0.2.0"
